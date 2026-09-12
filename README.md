@@ -28,6 +28,22 @@ python track.py
 Keys: `q` quit, `r` reset the track, `b` re-learn the room (torch off).
 The first time on a Mac it asks for camera access for the terminal.
 
+## Try it from any computer
+
+`app.py` is the same tracker as a web page, still all Python (built with Gradio):
+
+```
+python app.py --share
+```
+
+It prints a public link like `https://xxxx.gradio.live`. Anyone can open it in a
+browser, allow their camera, and the tracker runs on their torch live. The link
+works for 72 hours, as long as your laptop keeps `app.py` running.
+
+For a link that never expires, put the repo on Hugging Face Spaces (free):
+create a new Space, pick the Gradio SDK, and upload `app.py`, `tracker.py`,
+`track.py` and `requirements.txt`.
+
 ## What you see
 
 - **Crosshair and circle**: the centre of the view. Inside the circle for 10
@@ -104,6 +120,7 @@ way, flip its sign in `servo.py`.
 ## Files
 
 - `track.py` - camera loop, drawing, recording, logging, options
+- `app.py` - web version for any browser (Gradio)
 - `tracker.py` - detection, room model, Kalman filter, states, error
 - `stream.py` - websocket stream
 - `servo.py` - pan/tilt servos over serial (optional)

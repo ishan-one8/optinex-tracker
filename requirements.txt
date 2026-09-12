@@ -1,4 +1,5 @@
 opencv-python
 numpy
 websockets
+gradio  # only needed for app.py (the web version)
 pyserial  # only needed with --serial
