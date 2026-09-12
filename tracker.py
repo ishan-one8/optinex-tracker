@@ -4,7 +4,8 @@ import time
 import cv2
 import numpy as np
 
-LEARN_FRAMES = 30  # about a second of looking at the room before tracking starts
+WARMUP_FRAMES = 10  # a webcam's first frames are dark while its exposure settles, skip them
+LEARN_FRAMES = 20  # then learn the room from this many frames (about a second in total)
 
 
 class BeaconTracker:
@@ -53,7 +54,7 @@ class BeaconTracker:
 
     @property
     def learning(self):
-        return self.bg_frames < LEARN_FRAMES
+        return self.bg_frames < WARMUP_FRAMES + LEARN_FRAMES
 
     def find_blobs(self, blur):
         # the beacon has to be bright AND a lot brighter than that spot normally is,
@@ -89,12 +90,13 @@ class BeaconTracker:
 
         was_learning = self.learning
         if was_learning:
-            # average the first second of frames: that's what the room looks like
-            if self.background is None:
-                self.background = blur.astype(np.float32)
-            else:
-                cv2.accumulateWeighted(blur, self.background, 1 / (self.bg_frames + 1))
+            # average a second of frames (after the warm-up): that's what the room looks like
             self.bg_frames += 1
+            n = self.bg_frames - WARMUP_FRAMES
+            if n == 1:
+                self.background = blur.astype(np.float32)
+            elif n > 1:
+                cv2.accumulateWeighted(blur, self.background, 1 / n)
             self.blobs = []
         else:
             self.blobs = self.find_blobs(blur)
