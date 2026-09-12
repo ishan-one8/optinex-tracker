@@ -4,18 +4,22 @@ import time
 import cv2
 import numpy as np
 
+LEARN_FRAMES = 30  # about a second of looking at the room before tracking starts
+
 
 class BeaconTracker:
-    """Finds the beacon (brightest small spot) in each frame, follows it with a
-    Kalman filter and works out how far it is from the centre of the camera."""
+    """Finds the beacon (a small bright spot that isn't part of the room) in each
+    frame, follows it with a Kalman filter and works out how far it is from the
+    centre of the camera."""
 
-    def __init__(self, width, height, hfov=60.0, threshold=220, min_area=4, max_area=5000, gate_px=60, lock_px=25):
+    def __init__(self, width, height, hfov=60.0, threshold=220, max_area=None):
+        s = width / 640  # the pixel numbers below were picked on a 640 px wide image
         self.deg_per_px = hfov / width
         self.threshold = threshold
-        self.min_area = min_area  # smaller than this = noise
-        self.max_area = max_area  # bigger than this = a lamp or a window, not the beacon
-        self.gate_px = gate_px  # while tracking, only look this far from where we expect it
-        self.lock_px = lock_px  # within this of the centre counts as locked
+        self.min_area = 4 * s * s  # smaller than this = noise
+        self.max_area = max_area or 5000 * s * s  # bigger than this = a lamp or a window
+        self.gate_px = 60 * s  # while tracking, only look this far from where we expect it
+        self.lock_px = 25 * s  # within this of the centre counts as locked
         self.boresight = (width / 2, height / 2)
 
         # state = x, y, vx, vy (pixels, pixels/s)
@@ -23,6 +27,7 @@ class BeaconTracker:
         self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
         self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1.0
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 4.0
+        self.relearn()
         self.reset()
 
     def reset(self):
@@ -41,16 +46,28 @@ class BeaconTracker:
         # other lights seen while we had the beacon: [x, y, times_seen, last_seen]
         self.clutter = []
 
-    def find_blobs(self, gray):
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, mask = cv2.threshold(blur, self.threshold, 255, cv2.THRESH_BINARY)
+    def relearn(self):
+        """Forget what the room looks like and learn it again. Do it with the torch off."""
+        self.background = None
+        self.bg_frames = 0
+
+    @property
+    def learning(self):
+        return self.bg_frames < LEARN_FRAMES
+
+    def find_blobs(self, blur):
+        # the beacon has to be bright AND a lot brighter than that spot normally is,
+        # so ceiling lights, windows and screens that were there from the start don't count
+        new = cv2.subtract(blur, self.background.astype(np.uint8))
+        mask = ((blur > self.threshold) & (new > 40)).astype(np.uint8)
         n, _, stats, centroids = cv2.connectedComponentsWithStats(mask)
         blobs = []
         for i in range(1, n):
-            area = int(stats[i, cv2.CC_STAT_AREA])
+            x, y, w, h, area = (int(v) for v in stats[i])
             if area < self.min_area or area > self.max_area:
                 continue
-            x, y, w, h = stats[i, :4]
+            if area / (w * h) < 0.4 or max(w, h) > 3 * min(w, h):
+                continue  # long or ragged: an edge or a reflection, not a spot
             peak = int(blur[y : y + h, x : x + w].max())
             blobs.append((float(centroids[i][0]), float(centroids[i][1]), peak, area))
         # brightest first, if two are equally bright take the bigger one
@@ -58,7 +75,7 @@ class BeaconTracker:
         return blobs
 
     def is_clutter(self, blob):
-        return any(c[2] >= 10 and math.hypot(c[0] - blob[0], c[1] - blob[1]) < 20 for c in self.clutter)
+        return any(c[2] >= 10 and math.hypot(c[0] - blob[0], c[1] - blob[1]) < self.gate_px / 3 for c in self.clutter)
 
     def update(self, frame, dt):
         start = time.perf_counter()
@@ -68,7 +85,19 @@ class BeaconTracker:
             self.fps = 1 / dt if not self.fps else self.fps * 0.9 + 0.1 / dt
 
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.blobs = self.find_blobs(gray)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        was_learning = self.learning
+        if was_learning:
+            # average the first second of frames: that's what the room looks like
+            if self.background is None:
+                self.background = blur.astype(np.float32)
+            else:
+                cv2.accumulateWeighted(blur, self.background, 1 / (self.bg_frames + 1))
+            self.bg_frames += 1
+            self.blobs = []
+        else:
+            self.blobs = self.find_blobs(blur)
 
         target = None
         if self.tracking:
@@ -103,7 +132,7 @@ class BeaconTracker:
                 if b is target:
                     continue
                 for c in self.clutter:
-                    if math.hypot(c[0] - b[0], c[1] - b[1]) < 15:
+                    if math.hypot(c[0] - b[0], c[1] - b[1]) < self.gate_px / 4:
                         c[0], c[1], c[2], c[3] = b[0], b[1], c[2] + 1, self.t
                         break
                 else:
@@ -131,6 +160,14 @@ class BeaconTracker:
             err_x = err_y = aim_x = aim_y = 0.0
         err_px = math.hypot(err_x, err_y)
         err_mrad = math.radians(err_px * self.deg_per_px) * 1000
+
+        # let the room model follow slow lighting changes, but not around the
+        # beacon, or a torch held still would slowly fade into the background
+        if not was_learning:
+            keep = np.full(blur.shape, 255, np.uint8)
+            if x is not None:
+                cv2.circle(keep, (int(x), int(y)), int(self.gate_px), 0, -1)
+            cv2.accumulateWeighted(blur, self.background, 0.005, mask=keep)
 
         if not self.tracking:
             self.state = "SEARCHING"

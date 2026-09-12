@@ -22,7 +22,7 @@ def draw(frame, tr, d):
     # crosshair and lock circle
     cv2.line(frame, (bx - 20, by), (bx + 20, by), (255, 255, 255), 1)
     cv2.line(frame, (bx, by - 20), (bx, by + 20), (255, 255, 255), 1)
-    cv2.circle(frame, (bx, by), tr.lock_px, (255, 255, 255), 1)
+    cv2.circle(frame, (bx, by), int(tr.lock_px), (255, 255, 255), 1)
 
     for x, y, _, _ in tr.blobs:
         cv2.circle(frame, (int(x), int(y)), 9, (130, 130, 130), 1)
@@ -37,6 +37,8 @@ def draw(frame, tr, d):
         f"cmd pan {d['pan_cmd_deg']:+.2f}  tilt {d['tilt_cmd_deg']:+.2f} deg",
         f"{d['fps']:.0f} fps   {d['proc_ms']:.1f} ms   lock {d['lock_pct']:.0f}%",
     ]
+    if tr.learning:
+        text = ["LEARNING THE ROOM - keep the torch off"]
     for i, line in enumerate(text):
         cv2.putText(frame, line, (10, 26 + i * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     color if i == 0 else (255, 255, 255), 1, cv2.LINE_AA)
@@ -48,10 +50,11 @@ def main():
     ap.add_argument("--source", default="0", help="camera number, video file or stream url (default: webcam 0)")
     ap.add_argument("--hfov", type=float, default=60.0, help="camera's horizontal field of view in degrees")
     ap.add_argument("--threshold", type=int, default=220, help="how bright a pixel must be to count, 0-255")
-    ap.add_argument("--max-area", type=int, default=5000, help="biggest blob (px) that can be the beacon; raise it if the torch is close")
+    ap.add_argument("--max-area", type=int, help="biggest blob (px) that can be the beacon; raise it if the torch is close")
     ap.add_argument("--csv", default="tracklog.csv", help="log file, every frame goes in here ('' = no log)")
     ap.add_argument("--serve", action="store_true", help="stream the data live on ws://127.0.0.1:8765")
     ap.add_argument("--serial", help="serial port of the pan/tilt servo board, e.g. /dev/tty.usbmodem1101")
+    ap.add_argument("--record", help="save what the tracker window shows to a video file, e.g. demo.mp4")
     ap.add_argument("--no-window", action="store_true", help="don't show the video window")
     ap.add_argument("--fast", action="store_true", help="for video files: don't wait, run as fast as possible")
     args = ap.parse_args()
@@ -78,13 +81,19 @@ def main():
         from servo import PanTilt
         servo = PanTilt(args.serial)
 
+    recorder = None
+    if args.record:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        recorder = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"avc1"), fps, (w, h))
+
     log = writer = None
     if args.csv:
         log = open(args.csv, "w", newline="")
         writer = csv.DictWriter(log, fieldnames=FIELDS)
         writer.writeheader()
 
-    print(f"tracking {args.source} ({w}x{h})   q = quit, r = reset")
+    print(f"tracking {args.source} ({w}x{h})   q = quit, r = reset, b = re-learn the room")
+    print("keep the torch off for the first second while it learns the room")
     last = time.perf_counter()
     last_print = 0.0
     data = None
@@ -106,13 +115,19 @@ def main():
                 print(f"{data['state']:<9} err {data['err_mrad']:7.1f} mrad   {data['fps']:4.0f} fps   blobs {data['blobs']}")
                 last_print = now
 
+            if recorder or not args.no_window:
+                shown = draw(frame, tracker, data)
+            if recorder:
+                recorder.write(shown)
             if not args.no_window:
-                cv2.imshow("OptiNex tracker", draw(frame, tracker, data))
+                cv2.imshow("OptiNex tracker", shown)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
                 if key == ord("r"):
                     tracker.reset()
+                if key == ord("b"):
+                    tracker.relearn()
             elif is_file and not args.fast:
                 time.sleep(max(0.0, file_dt - (time.perf_counter() - now)))
 
@@ -121,6 +136,8 @@ def main():
         pass
     finally:
         cap.release()
+        if recorder:
+            recorder.release()
         if log:
             log.close()
         if stream:
@@ -131,6 +148,8 @@ def main():
         print(f"\n{tracker.frames} frames, locked {data['lock_pct']}% of the time, first lock at {tracker.first_lock} s")
         if args.csv:
             print(f"log saved to {args.csv}")
+        if args.record:
+            print(f"video saved to {args.record}")
 
 
 if __name__ == "__main__":
